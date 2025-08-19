@@ -243,10 +243,18 @@ def get_subscription(signed_id):
             logger.error(f"Ключ не найден для пользователя {user_id}")
             return Response("Key not found", status=404, mimetype='text/plain')
         
-        # Проверяем активность подписки
-        if not key_manager.is_subscription_active(user_id):
+        # Проверяем активность и соответствие типа подписки токену
+        try:
+            user_sub = key_manager.get_user_subscription(user_id)
+        except Exception:
+            user_sub = None
+        if not user_sub or not key_manager.is_subscription_active(user_id):
             logger.error(f"Подписка неактивна для пользователя {user_id}")
             return Response("Subscription inactive", status=403, mimetype='text/plain')
+        current_type = str((user_sub or {}).get('type') or '')
+        if subscription_type and current_type and current_type != subscription_type:
+            logger.error(f"Несоответствие типа подписки: у пользователя {user_id} активен '{current_type}', в токене запрошен '{subscription_type}'")
+            return Response("Subscription type mismatch", status=403, mimetype='text/plain')
         
         # Нормализуем ключ для V2RayTun и ОТДАЕМ RAW VLESS (не base64)
         normalized_key = normalize_vless_for_v2raytun(user_key)
@@ -531,21 +539,12 @@ def go_launcher(token: str):
         ]
         if add_config:
             candidates.append(add_config)
-        candidates.append(f"intent://import?url={enc_sub_url}#Intent;scheme=v2raytun;package=com.v2raytun;end")
+        candidates.append(f"intent://import?url={enc_sub_url}#Intent;scheme=v2raytun;package=com.v2raytun.android;end")
 
-        # Не помечаем токен использованным: разрешаем многократное открытие до истечения TTL
-
-        # Логи
-        try:
-            logger.info(json.dumps({
-                'event': 'go_opened',
-                'uid': user_id,
-                'tariff': tariff,
-                'ip': request.remote_addr,
-                'ua': request.headers.get('User-Agent', '')[:180]
-            }, ensure_ascii=False))
-        except Exception:
-            pass
+        # Подготовим ссылки моста /open для наиболее совместимых вариантов
+        open_bridge_import = f"{base}/open?url={urllib.parse.quote(candidates[0], safe='')}"
+        open_bridge_intent = f"{base}/open?url={urllib.parse.quote(candidates[-1], safe='')}"
+        open_bridge_add = (f"{base}/open?url={urllib.parse.quote(add_config, safe='')}" if add_config else '')
 
         html = f"""<!doctype html>
 <html lang="ru">
@@ -563,8 +562,10 @@ def go_launcher(token: str):
     <p class="muted">Если приложение не открылось автоматически, используйте кнопки ниже.</p>
     <div class="row"><a id="retry" class="btn" href="#">Открыть снова</a></div>
     <div class="row"><a id="sys" class="btn" href="{candidates[-1]}">Открыть через систему (Android)</a></div>
+    <div class="row"><a class="btn" href="{open_bridge_import}">Через HTTPS‑мост (import)</a></div>
     <div class="row"><a id="alt1" class="btn" href="https://deeplink.website/?url={urllib.parse.quote(candidates[0], safe='')}">Через deeplink.website (import)</a></div>
     <div class="row"><a id="alt2" class="btn" href="https://deeplink.website/?url={urllib.parse.quote(candidates[1], safe='')}">Через deeplink.website (import-config)</a></div>
+    {('<div class="row"><a class="btn" href="'+open_bridge_add+'">Через HTTPS‑мост (add?config)</a></div>' if add_config else '')}
     {('<div class="row"><a class="btn" href="https://deeplink.website/?url='+urllib.parse.quote(add_config, safe='')+'">Через deeplink.website (add?config)</a></div>' if add_config else '')}
 
     <script>
