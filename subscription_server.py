@@ -1,3 +1,4 @@
+# subscription_server.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -10,7 +11,7 @@ Subscription сервер для автоматического подключе
 - POST /admin/assign       (X-Auth-Token) — привязка ключа к user_id (и фиксация подписки)
 - GET  /sub/<token>        — RAW VLESS (token = base64url("uid_type") ИЛИ HMAC-токен)
 - GET  /sub/<token>?b64=1  — base64 VLESS (подписочный .sub)
-- GET  /sub/<token>.sub    — 302 на /sub/<token>?b64=1 (удобно для клиентов ожидающих .sub)
+- GET  /sub/<token>.sub    — 302 на /sub/<token>?b64=1 (совместимость с клиентами)
 - GET  /go/<token>         — HTML лаунчер с набором deeplink-вариантов (для диагностики)
 - GET  /open?url=...       — HTTPS‑мост для безопасного открытия v2raytun:// из Telegram
 - GET  /health
@@ -20,7 +21,9 @@ Subscription сервер для автоматического подключе
   либо {'subscriptions': {...}} либо сразу {uid: {...}}
 """
 
-from flask import Flask, Response, request, jsonify
+from __future__ import annotations
+
+from flask import Flask, Response, request, jsonify, redirect
 import re
 import urllib.parse
 import json
@@ -321,7 +324,6 @@ def admin_assign():
             'updated_at': start_iso
         }
 
-        # сохраняем обратно в исходную структуру
         if subs is not subs_root:
             subs_root['subscriptions'] = subs
         with open(_SUBS_JSON_PATH, 'w', encoding='utf-8') as f:
@@ -341,12 +343,11 @@ def get_subscription(token: str):
       - legacy base64url('<uid>_<type>')
     ?b64=1 — вернёт base64 .sub для клиентов, требующих подписочный формат
     """
-    # Инициализация key_manager при первом обращении (не обязательно)
     global key_manager
     if key_manager is None:
         init_key_manager()
 
-    # Разбор токена (HMAC + fallback legacy)
+    # Разбор токена
     try:
         payload = _verify_token(token)
     except Exception:
@@ -354,7 +355,7 @@ def get_subscription(token: str):
     user_id = int(payload.get('uid'))
     subscription_type = str(payload.get('t') or '')
 
-    # 1) Пытаемся получить ключ через key_manager
+    # 1) KeyManager
     user_key = None
     if key_manager is not None:
         try:
@@ -391,7 +392,7 @@ def get_subscription(token: str):
     if not user_key:
         return Response("Key not found", status=404, mimetype='text/plain')
 
-    # Проверка активности подписки
+    # Проверка активности
     user_sub = sub
     is_active = False
     if isinstance(user_sub, dict):
@@ -407,14 +408,13 @@ def get_subscription(token: str):
     if not user_sub or not is_active:
         return Response("Subscription inactive", status=403, mimetype='text/plain')
 
-    current_type = str((user_sub or {}).get('type') or '')
-    if subscription_type and current_type and current_type != subscription_type:
+    if subscription_type and str(user_sub.get('type') or '') != subscription_type:
         return Response("Subscription type mismatch", status=403, mimetype='text/plain')
 
     # Нормализуем ключ
     normalized_key = normalize_vless_for_v2raytun(user_key)
 
-    # Поддержка base64 режима
+    # base64 режим
     want_b64 = str(request.args.get('b64') or '').lower() in ('1', 'true', 'yes', 'b64')
     body_text = normalized_key
     if want_b64:
@@ -423,7 +423,6 @@ def get_subscription(token: str):
         except Exception:
             body_text = normalized_key
 
-    # Заголовки для корректной работы клиентов
     headers = {
         'Content-Type': 'text/plain; charset=utf-8',
         'Content-Disposition': f'inline; filename="{user_id}_{subscription_type or "vpn"}.sub"',
@@ -437,7 +436,6 @@ def get_subscription(token: str):
 @app.route('/sub/<token>.sub')
 def get_subscription_file(token: str):
     """Совместимый путь для клиентов, ожидающих .sub — перенаправляет на base64-выдачу."""
-    from flask import redirect
     return redirect(f"/sub/{token}?b64=1", code=302)
 
 
@@ -448,7 +446,7 @@ def health_check():
 
 @app.route('/copy')
 def copy_page():
-    """Мини-страница копирования текста в буфер."""
+    """Простая страница для копирования текста."""
     try:
         text = request.args.get('text', '').strip()
         preview = (text[:140] + '…') if len(text) > 140 else text
