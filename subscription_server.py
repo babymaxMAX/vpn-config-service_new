@@ -483,29 +483,30 @@ def open_scheme():
         if not decoded.lower().startswith('v2raytun://'):
             return Response("Unsupported scheme", status=400, mimetype='text/plain')
 
-        # HTML страница с авто-переходом и запасной кнопкой
+        # HTML страница с авто-переходом и запасной кнопкой (без f-строк, чтобы не экранировать фигурные скобки)
         safe_href = json.dumps(decoded)
-        html = f"""<!DOCTYPE html>
-<html lang="ru"><head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Открытие V2RayTun</title>
-<script>
-  (function(){
-    var t={safe_href};
-    try{ window.location.replace(t); }catch(e){ window.location.href=t; }
-    setTimeout(function(){
-      // Если Telegram блокирует мгновенный переход, показываем ссылку ниже
-      document.getElementById('fallback').style.display='block';
-    }, 800);
-  })();
-</script>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial;max-width:760px;margin:24px auto;padding:0 16px}a.btn{display:inline-block;background:#111827;color:#fff;text-decoration:none;border-radius:8px;padding:10px 14px}</style>
-</head><body>
-  <h3>Открываем V2RayTun…</h3>
-  <div id="fallback" style="display:none">Если приложение не открылось автоматически, нажмите кнопку:</div>
-  <p><a class="btn" href="{decoded}">Открыть приложение</a></p>
-</body></html>"""
+        html = (
+            "<!DOCTYPE html>"
+            "<html lang=\\\"ru\\\"><head>"
+            "<meta charset=\\\"UTF-8\\\"/>"
+            "<meta name=\\\"viewport\\\" content=\\\"width=device-width, initial-scale=1\\\"/>"
+            "<title>Открытие V2RayTun</title>"
+            "<script>"
+            "  (function(){"
+            "    var t=" + safe_href + ";"
+            "    try{ window.location.replace(t); }catch(e){ window.location.href=t; }"
+            "    setTimeout(function(){"
+            "      document.getElementById('fallback').style.display='block';"
+            "    }, 800);"
+            "  })();"
+            "</script>"
+            "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial;max-width:760px;margin:24px auto;padding:0 16px}a.btn{display:inline-block;background:#111827;color:#fff;text-decoration:none;border-radius:8px;padding:10px 14px}</style>"
+            "</head><body>"
+            "  <h3>Открываем V2RayTun…</h3>"
+            "  <div id=\\\"fallback\\\" style=\\\"display:none\\\">Если приложение не открылось автоматически, нажмите кнопку:</div>"
+            "  <p><a class=\\\"btn\\\" href=\\\"" + decoded + "\\\">Открыть приложение</a></p>"
+            "</body></html>"
+        )
         return Response(html, status=200, mimetype='text/html')
     except Exception as e:
         logger.error(f"Ошибка в /open: {e}")
