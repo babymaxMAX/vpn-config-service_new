@@ -1,63 +1,57 @@
-# subscription_server.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Subscription сервер для автоматического подключения V2Ray (совместим с V2RayTun).
-Отдаёт RAW VLESS или base64 .sub по HTTPS. Поддерживает старый token (base64 "uid_type")
-и короткоживущий HMAC-токен.
+Subscription сервер для авто-подключения V2Ray (совместим с V2RayTun).
+
+Ключевые особенности исправленной версии:
+- .sub возвращает СЫРОЙ vless (text/plain), без редиректов и без base64 — важно для iOS V2RayTun.
+- ?b64=1 остаётся как опция для клиентов, ожидающих base64.
+- Поддержка двух типов токенов: legacy (base64url("<uid>_<type>")) и HMAC-SHA256 (короткоживущий).
+- Эндпоинты /open и /go для надёжного открытия deeplink из Telegram/WebView.
+- Совместимость с локальным форматом бота (subscriptions.json, key_data.json, optional KeyManager).
 
 Эндпоинты:
-- POST /admin/keys/upload  (X-Auth-Token) — загрузка trial/month/year ключей в локальные файлы
-- POST /admin/assign       (X-Auth-Token) — привязка ключа к user_id (и фиксация подписки)
-- GET  /sub/<token>        — RAW VLESS (token = base64url("uid_type") ИЛИ HMAC-токен)
-- GET  /sub/<token>?b64=1  — base64 VLESS (подписочный .sub)
-- GET  /sub/<token>.sub    — 302 на /sub/<token>?b64=1 (совместимость с клиентами)
-- GET  /go/<token>         — HTML лаунчер с набором deeplink-вариантов (для диагностики)
-- GET  /open?url=...       — HTTPS‑мост для безопасного открытия v2raytun:// из Telegram
+- POST /admin/keys/upload        (X-Auth-Token)
+- POST /admin/assign             (X-Auth-Token)
+- GET  /sub/<token>              — RAW vless или base64 (по ?b64)
+- GET  /sub/<token>.sub          — СЫРОЙ vless (без редиректа и без base64)
+- GET  /open?url=...             — HTTPS-мост для v2raytun://
+- GET  /go/<token>               — HTML-страница с вариантами deeplink
 - GET  /health
-
-Файлы:
-- subscriptions.json — используется как первичный источник (совместим с форматом бота)
-  либо {'subscriptions': {...}} либо сразу {uid: {...}}
 """
 
 from __future__ import annotations
 
-from flask import Flask, Response, request, jsonify, redirect
-import re
-import urllib.parse
+from flask import Flask, Response, request, jsonify
 import json
 import logging
 import base64
 import hmac
 import hashlib
-import time
 import os
+import time
+import re
+import urllib.parse
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Доступ к локальным модулям (если есть key_manager)
-import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-key_manager = None
-
-# Безопасные токены (HMAC-SHA256 base64url) для /go и /sub
+# Секрет для HMAC и админ-операций
 _SIGN_SECRET = os.environ.get('AUTH_TOKEN', '') or 'dev-secret'
 
-# Пути к данным и совместимость с файлами бота
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 _DATA_DIR = os.environ.get('DATA_DIR', '').strip() or os.path.join(_PROJECT_ROOT, 'data')
 try:
     os.makedirs(_DATA_DIR, exist_ok=True)
 except Exception:
     pass
-_SUBS_JSON_PATH_ENV = os.environ.get('SUBS_JSON_PATH', '').strip()
-_SUBS_JSON_PATH = _SUBS_JSON_PATH_ENV or os.path.join(_PROJECT_ROOT, 'subscriptions.json')
+
+_SUBS_JSON_PATH = os.environ.get('SUBS_JSON_PATH', '').strip() or os.path.join(_PROJECT_ROOT, 'subscriptions.json')
 _SUBS_JSON_FALLBACK = os.path.join(_DATA_DIR, 'subscriptions.json')
 
+
+# =============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===============
 
 def _b64url_encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
@@ -96,7 +90,7 @@ def _verify_token(token: str) -> dict:
 
 
 def _parse_legacy_token(token: str) -> dict:
-    """Парсинг старого токена base64url('<uid>_<type>') → {'uid':int, 't':str}."""
+    """base64url('<uid>_<type>') → {'uid': int, 't': str}"""
     pad = '=' * (-len(token) % 4)
     raw = base64.urlsafe_b64decode((token + pad).encode('ascii')).decode('utf-8')
     if '_' in raw:
@@ -105,8 +99,7 @@ def _parse_legacy_token(token: str) -> dict:
         uid_str, tariff = raw.split('-', 1)
     else:
         raise ValueError('bad_legacy_format')
-    uid = int(str(uid_str).strip())
-    return {'uid': uid, 't': str(tariff).strip()}
+    return {'uid': int(uid_str), 't': str(tariff).strip()}
 
 
 def _load_json_safe(path: str, default):
@@ -120,7 +113,6 @@ def _load_json_safe(path: str, default):
 
 
 def _load_subscriptions_compat() -> dict:
-    """Читает subscriptions.json в любом из поддерживаемых форматов."""
     data = _load_json_safe(_SUBS_JSON_PATH, default=None)
     if isinstance(data, dict):
         if 'subscriptions' in data and isinstance(data['subscriptions'], dict):
@@ -133,7 +125,7 @@ def _load_subscriptions_compat() -> dict:
 
 
 def init_key_manager():
-    """Мягкая инициализация KeyManager (если присутствует)."""
+    """Мягкая инициализация KeyManager, если есть в проекте."""
     global key_manager
     try:
         from key_manager import KeyManager
@@ -163,12 +155,6 @@ def _get_user_subscription_from_files(user_id: int) -> dict | None:
 
 
 def normalize_vless_for_v2raytun(vless_key: str) -> str:
-    """
-    Нормализует VLESS:
-    - удаляет authority
-    - добавляет encryption=none если отсутствует
-    - чистит fragment от неалфанумерических символов
-    """
     try:
         if not vless_key.startswith('vless://'):
             return vless_key
@@ -191,23 +177,21 @@ def normalize_vless_for_v2raytun(vless_key: str) -> str:
         if 'encryption' not in normalized_params:
             normalized_params['encryption'] = 'none'
 
-        # Сборка строки параметров
-        params_list = []
-        for key, value in normalized_params.items():
-            if value:
-                params_list.append(f"{key}={value}")
+        pairs = []
+        for k, v in normalized_params.items():
+            if v:
+                pairs.append(f"{k}={v}")
             else:
-                params_list.append(key)
-        params_string = '&'.join(params_list)
+                pairs.append(k)
+        params_string = '&'.join(pairs)
 
-        normalized_key = f"vless://{uuid}@{host}:{port}?{params_string}"
+        out = f"vless://{uuid}@{host}:{port}?{params_string}"
         if fragment:
             clean_fragment = re.sub(r'[^\w\-]', '', fragment)
             if clean_fragment:
-                normalized_key += f"#{clean_fragment}"
-        return normalized_key
+                out += f"#{clean_fragment}"
+        return out
     except Exception:
-        # Fallback — простое удаление authority и чистка хвостов
         key = re.sub(r'[&?]authority=(?=&|$)', '', vless_key)
         key = re.sub(r'[&?]authority=[^&]*(?=&|$)', '', key)
         key = re.sub(r'[?&]&+', '?', key)
@@ -216,9 +200,10 @@ def normalize_vless_for_v2raytun(vless_key: str) -> str:
         return key
 
 
+# =============== АДМИН ЭНДПОИНТЫ ===============
+
 @app.route('/admin/keys/upload', methods=['POST'])
 def admin_upload_keys():
-    """Добавление новых ключей (файловый режим, вспомогательное)."""
     auth = request.headers.get('X-Auth-Token', '')
     if not _SIGN_SECRET or auth != _SIGN_SECRET:
         return Response('Unauthorized', status=401, mimetype='text/plain')
@@ -262,7 +247,6 @@ def admin_upload_keys():
 
 @app.route('/admin/assign', methods=['POST'])
 def admin_assign():
-    """Привязка ключа к пользователю (совместимо с форматом бота)."""
     auth = request.headers.get('X-Auth-Token', '')
     if not _SIGN_SECRET or auth != _SIGN_SECRET:
         return Response('Unauthorized', status=401, mimetype='text/plain')
@@ -281,7 +265,7 @@ def admin_assign():
 
     key = normalize_vless_for_v2raytun(key)
 
-    # Синхронизируем с key_data.json (если используется EnhancedKeyManager)
+    # Синхронизация с key_data.json при наличии
     try:
         kd_path = os.path.join(_PROJECT_ROOT, 'key_data.json')
         kd = {}
@@ -297,7 +281,7 @@ def admin_assign():
     except Exception:
         pass
 
-    # Обновляем subscriptions.json (совместимый формат с ботом)
+    # Обновляем subscriptions.json (совместимый формат)
     try:
         subs_root = _load_json_safe(_SUBS_JSON_PATH, {}) or {}
         if 'subscriptions' in subs_root and isinstance(subs_root['subscriptions'], dict):
@@ -334,98 +318,113 @@ def admin_assign():
     return Response('OK', status=200, mimetype='text/plain')
 
 
-@app.route('/sub/<token>')
-def get_subscription(token: str):
-    """
-    Возвращает RAW VLESS для указанного <token>.
-    Поддерживает:
-      - HMAC-токен (короткоживущий)
-      - legacy base64url('<uid>_<type>')
-    ?b64=1 — вернёт base64 .sub для клиентов, требующих подписочный формат
-    """
+# =============== ОТДАЧА ПОДПИСКИ ===============
+
+key_manager = None
+
+
+def _resolve_user_key(user_id: int) -> tuple[str | None, dict | None]:
+    """Возвращает (vless_key, user_sub_record)."""
     global key_manager
     if key_manager is None:
         init_key_manager()
 
-    # Разбор токена
-    try:
-        payload = _verify_token(token)
-    except Exception:
-        payload = _parse_legacy_token(token)
-    user_id = int(payload.get('uid'))
-    subscription_type = str(payload.get('t') or '')
-
     # 1) KeyManager
-    user_key = None
     if key_manager is not None:
         try:
-            user_key = key_manager.get_user_key(user_id)
+            k = key_manager.get_user_key(user_id)
+            if k:
+                return k, _get_user_subscription_from_files(user_id)
         except Exception:
-            user_key = None
+            pass
 
-    # 2) EnhancedKeyManager (key_data.json)
-    if not user_key:
-        try:
-            kd_path = os.path.join(_PROJECT_ROOT, 'key_data.json')
-            if os.path.exists(kd_path):
-                with open(kd_path, 'r', encoding='utf-8') as f:
-                    kd = json.load(f)
-                key_assignments = kd.get('key_assignments', {})
-                for k, uid in key_assignments.items():
-                    try:
-                        if int(uid) == int(user_id):
-                            user_key = k
-                            break
-                    except Exception:
-                        continue
-        except Exception:
-            user_key = None
+    # 2) key_data.json
+    try:
+        kd_path = os.path.join(_PROJECT_ROOT, 'key_data.json')
+        if os.path.exists(kd_path):
+            with open(kd_path, 'r', encoding='utf-8') as f:
+                kd = json.load(f)
+            key_assignments = kd.get('key_assignments', {})
+            for k, uid in key_assignments.items():
+                try:
+                    if int(uid) == int(user_id):
+                        return k, _get_user_subscription_from_files(user_id)
+                except Exception:
+                    continue
+    except Exception:
+        pass
 
-    # 3) Основной источник — subscriptions.json
+    # 3) subscriptions.json
     subs_map = _load_subscriptions_compat()
-    sub = subs_map.get(str(user_id)) or subs_map.get(user_id)
-    if not user_key and isinstance(sub, dict):
-        k = str(sub.get('key') or '').strip()
+    rec = subs_map.get(str(user_id)) or subs_map.get(user_id)
+    if isinstance(rec, dict):
+        k = str(rec.get('key') or '').strip()
         if k.startswith('vless://'):
-            user_key = k
+            return k, rec
+    return None, rec
 
+
+def _is_active_subscription(rec: dict | None) -> bool:
+    if not isinstance(rec, dict):
+        return False
+    try:
+        from datetime import datetime, timezone
+        end_iso = str(rec.get('end_date') or '').replace('Z', '+00:00')
+        active = bool(rec.get('active', True))
+        if end_iso:
+            end_dt = datetime.fromisoformat(end_iso)
+            return active and (datetime.now(tz=end_dt.tzinfo or timezone.utc) <= end_dt)
+        return active
+    except Exception:
+        return bool(rec)
+
+
+def _extract_payload(token: str) -> dict:
+    try:
+        return _verify_token(token)
+    except Exception:
+        return _parse_legacy_token(token)
+
+
+def _build_body_for_client(user_key: str, b64: bool) -> str:
+    norm = normalize_vless_for_v2raytun(user_key)
+    if b64:
+        try:
+            return base64.b64encode(norm.encode('utf-8')).decode('ascii')
+        except Exception:
+            return norm
+    return norm
+
+
+@app.route('/sub/<token>')
+def get_subscription(token: str):
+    """
+    Возвращает RAW vless для <token>.
+    Поддерживает HMAC и legacy. ?b64=1 — вернёт base64.
+    """
+    try:
+        payload = _extract_payload(token)
+        user_id = int(payload.get('uid'))
+        tariff = str(payload.get('t') or '')
+    except Exception:
+        return Response('Bad or expired token', status=400, mimetype='text/plain')
+
+    user_key, rec = _resolve_user_key(user_id)
     if not user_key:
-        return Response("Key not found", status=404, mimetype='text/plain')
+        return Response('Key not found', status=404, mimetype='text/plain')
 
-    # Проверка активности
-    user_sub = sub
-    is_active = False
-    if isinstance(user_sub, dict):
-        try:
-            from datetime import datetime, timezone
-            end_iso = str(user_sub.get('end_date') or '').replace('Z', '+00:00')
-            is_active = bool(user_sub.get('active', True))
-            if end_iso:
-                end_dt = datetime.fromisoformat(end_iso)
-                is_active = is_active and (datetime.now(tz=end_dt.tzinfo or timezone.utc) <= end_dt)
-        except Exception:
-            is_active = bool(user_sub)
-    if not user_sub or not is_active:
-        return Response("Subscription inactive", status=403, mimetype='text/plain')
+    if not _is_active_subscription(rec):
+        return Response('Subscription inactive', status=403, mimetype='text/plain')
 
-    if subscription_type and str(user_sub.get('type') or '') != subscription_type:
-        return Response("Subscription type mismatch", status=403, mimetype='text/plain')
+    if tariff and isinstance(rec, dict) and str(rec.get('type') or '') != tariff:
+        return Response('Subscription type mismatch', status=403, mimetype='text/plain')
 
-    # Нормализуем ключ
-    normalized_key = normalize_vless_for_v2raytun(user_key)
-
-    # base64 режим
     want_b64 = str(request.args.get('b64') or '').lower() in ('1', 'true', 'yes', 'b64')
-    body_text = normalized_key
-    if want_b64:
-        try:
-            body_text = base64.b64encode(normalized_key.encode('utf-8')).decode('ascii')
-        except Exception:
-            body_text = normalized_key
+    body_text = _build_body_for_client(user_key, want_b64)
 
     headers = {
         'Content-Type': 'text/plain; charset=utf-8',
-        'Content-Disposition': f'inline; filename="{user_id}_{subscription_type or "vpn"}.sub"',
+        'Content-Disposition': f'inline; filename="{user_id}_{tariff or "vpn"}.sub"',
         'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
         'subscription-userinfo': 'upload=0; download=0; total=0; expire=0'
@@ -435,136 +434,99 @@ def get_subscription(token: str):
 
 @app.route('/sub/<token>.sub')
 def get_subscription_file(token: str):
-    """Совместимый путь для клиентов, ожидающих .sub — перенаправляет на base64-выдачу."""
-    return redirect(f"/sub/{token}?b64=1", code=302)
-
-
-@app.route('/health')
-def health_check():
-    return Response("OK", status=200, mimetype='text/plain')
-
-
-@app.route('/copy')
-def copy_page():
-    """Простая страница для копирования текста."""
+    """
+    ВАЖНО: .sub отдаёт СЫРОЙ vless текст без редиректов и без base64 —
+    это требование клиентов на iOS (V2RayTun), которые не следуют 302 и не принимают base64.
+    """
     try:
-        text = request.args.get('text', '').strip()
-        preview = (text[:140] + '…') if len(text) > 140 else text
-        html = f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Копирование ключа</title>
-<style>body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial;max-width:760px;margin:24px auto;padding:0 16px}}.mono{{font-family:ui-monospace, SFMono-Regular, Menlo, monospace;background:#f6f8fa;border:1px solid #e5e7eb;border-radius:8px;padding:10px;word-break:break-all}}.btn{{display:inline-block;background:#111827;color:#fff;text-decoration:none;border-radius:8px;padding:10px 14px;margin-top:12px}}.muted{{color:#6b7280;font-size:14px}}</style>
-<script>async function doCopy(){{try{{await navigator.clipboard.writeText({json.dumps(text)});document.getElementById('res').textContent='✅ Ключ скопирован';}}catch(e){{document.getElementById('res').textContent='Скопируйте вручную';}}}}window.addEventListener('load',()=>{{setTimeout(doCopy,50);}});</script>
-</head>
-<body>
-<h3>Ключ для копирования</h3>
-<div class="mono">{preview}</div>
-<p class="muted" id="res">Пытаемся скопировать…</p>
-<a class="btn" href="#" onclick="doCopy();return false;">📋 Скопировать</a>
-</body>
-</html>"""
-        return Response(html, status=200, mimetype='text/html')
+        payload = _extract_payload(token)
+        user_id = int(payload.get('uid'))
+        # тип тарифа на .sub не проверяем строго, чтобы не ломать импорт
     except Exception:
-        return Response("Error", status=500, mimetype='text/plain')
+        return Response('Bad or expired token', status=400, mimetype='text/plain')
 
+    user_key, rec = _resolve_user_key(user_id)
+    if not user_key:
+        return Response('Key not found', status=404, mimetype='text/plain')
+    if not _is_active_subscription(rec):
+        return Response('Subscription inactive', status=403, mimetype='text/plain')
+
+    body_text = _build_body_for_client(user_key, b64=False)  # СЫРОЙ vless
+    headers = {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Disposition': f'inline; filename="{user_id}.sub"',
+        'Cache-Control': 'no-store',
+        'Access-Control-Allow-Origin': '*'
+    }
+    return Response(body_text, status=200, mimetype='text/plain', headers=headers)
+
+
+# =============== УТИЛИТЫ: /open и /go ===============
 
 @app.route('/open')
 def open_scheme():
-    """HTTPS‑мост для открытия v2raytun:// из Telegram."""
     try:
         raw = (request.args.get('url') or '').strip()
         if not raw:
-            return Response("Missing url", status=400, mimetype='text/plain')
-        import urllib.parse as _up
+            return Response('Missing url', status=400, mimetype='text/plain')
         try:
-            decoded = _up.unquote(raw)
+            decoded = urllib.parse.unquote(raw)
         except Exception:
             decoded = raw
         if not decoded.lower().startswith('v2raytun://'):
-            return Response("Unsupported scheme", status=400, mimetype='text/plain')
+            return Response('Unsupported scheme', status=400, mimetype='text/plain')
 
         safe_href = json.dumps(decoded)
         html = ("<!DOCTYPE html>"
-                "<html lang=\\\"ru\\\"><head>"
-                "<meta charset=\\\"UTF-8\\\"/>"
-                "<meta name=\\\"viewport\\\" content=\\\"width=device-width, initial-scale=1\\\"/>"
+                "<html lang=\"ru\"><head>"
+                "<meta charset=\"UTF-8\"/>"
+                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>"
                 "<title>Открытие V2RayTun</title>"
                 "<script>"
                 "  (function(){"
                 "    var t=" + safe_href + ";"
                 "    try{ window.location.replace(t); }catch(e){ window.location.href=t; }"
-                "    setTimeout(function(){"
-                "      document.getElementById('fallback').style.display='block';"
-                "    }, 800);"
+                "    setTimeout(function(){ document.getElementById('fallback').style.display='block'; }, 900);"
                 "  })();"
                 "</script>"
                 "<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial;max-width:760px;margin:24px auto;padding:0 16px}a.btn{display:inline-block;background:#111827;color:#fff;text-decoration:none;border-radius:8px;padding:10px 14px}</style>"
                 "</head><body>"
                 "  <h3>Открываем V2RayTun…</h3>"
-                "  <div id=\\\"fallback\\\" style=\\\"display:none\\\">Если приложение не открылось автоматически, нажмите кнопку:</div>"
-                "  <p><a class=\\\"btn\\\" href=\\\"" + decoded + "\\\">Открыть приложение</a></p>"
+                "  <div id=\"fallback\" style=\"display:none\">Если приложение не открылось автоматически, нажмите кнопку:</div>"
+                "  <p><a class=\"btn\" href=\"" + decoded + "\">Открыть приложение</a></p>"
                 "</body></html>")
         return Response(html, status=200, mimetype='text/html')
     except Exception as e:
         logger.error(f"/open error: {e}")
-        return Response("Internal error", status=500, mimetype='text/plain')
-
-
-@app.route('/admin/go', methods=['GET'])
-def admin_generate_go():
-    """Генерация ссылки /go (диагностика). Требует X-Auth-Token."""
-    auth = request.headers.get('X-Auth-Token', '')
-    if not _SIGN_SECRET or auth != _SIGN_SECRET:
-        return Response('Unauthorized', status=401, mimetype='text/plain')
-
-    try:
-        user_id = int(request.args.get('uid') or '0')
-    except Exception:
-        user_id = 0
-    tariff = (request.args.get('t') or 'trial').strip()
-    try:
-        ttl = int(request.args.get('ttl') or '600')
-    except Exception:
-        ttl = 600
-    if not user_id:
-        return Response('Bad request', status=400, mimetype='text/plain')
-
-    token = _sign_dict({'uid': user_id, 't': tariff}, ttl_seconds=ttl)
-    base = request.url_root.rstrip('/')
-
-    return Response(json.dumps({'url': f"{base}/go/{token}", 'token': token}, ensure_ascii=False),
-                    status=200, mimetype='application/json')
+        return Response('Internal error', status=500, mimetype='text/plain')
 
 
 @app.route('/go/<token>')
 def go_launcher(token: str):
-    """HTML‑лаунчер с несколькими deeplink-вариантами (для различных сборок клиента)."""
     try:
         payload = _verify_token(token)
         user_id = int(payload.get('uid'))
         tariff = str(payload.get('t') or '')
+    except Exception as e:
+        logger.error(f"/go error (token): {e}")
+        return Response('Bad or expired token', status=400, mimetype='text/plain')
 
+    try:
+        # генерируем свежий HMAC для подписки (коротко живёт, но годится для редиректов)
         signed_id = _sign_dict({'uid': user_id, 't': tariff}, ttl_seconds=300)
         base = request.url_root.rstrip('/')
         sub_url = f"{base}/sub/{signed_id}"
-        enc_sub_url = urllib.parse.quote(sub_url, safe='')
-
         sub_b64_url = f"{sub_url}?b64=1"
-        enc_sub_b64_url = urllib.parse.quote(sub_b64_url, safe='')
+        sub_sub_url = f"{sub_url}.sub"  # сырой текст
+        enc = urllib.parse.quote
 
         candidates = [
-            f"v2raytun://import?url={enc_sub_url}&autostart=1",
-            f"v2raytun://import?url={enc_sub_b64_url}&autostart=1",
-            f"v2raytun://import-config?url={enc_sub_url}",
-            f"v2raytun://import-config?url={enc_sub_b64_url}",
-            f"v2raytun://subscribe?url={enc_sub_url}",
-            f"v2raytun://subscribe?url={enc_sub_b64_url}",
+            f"v2raytun://import-config?url={enc(sub_sub_url, safe='')}",  # .sub сырой
+            f"v2raytun://import?url={enc(sub_b64_url, safe='')}&autostart=1",
+            f"v2raytun://subscribe?url={enc(sub_url, safe='')}",
         ]
 
-        open_bridge_import = f"{base}/open?url={urllib.parse.quote(candidates[0], safe='')}"
+        open_bridge = f"{base}/open?url={urllib.parse.quote(candidates[0], safe='')}"
         html = f"""<!doctype html>
 <html lang="ru">
   <meta charset="utf-8"/>
@@ -579,10 +541,10 @@ def go_launcher(token: str):
   <body>
     <h2>Открываем V2RayTun…</h2>
     <p class="muted">Если приложение не открылось автоматически, используйте кнопки ниже.</p>
-    <div class="row"><a class="btn" href="{open_bridge_import}">Через HTTPS‑мост (import)</a></div>
-    <div class="row"><a class="btn" href="{candidates[0]}">Открыть (import)</a></div>
-    <div class="row"><a class="btn" href="{candidates[2]}">Открыть (import-config)</a></div>
-    <div class="row"><a class="btn" href="{candidates[4]}">Открыть (subscribe)</a></div>
+    <div class="row"><a class="btn" href="{open_bridge}">Через HTTPS‑мост (.sub)</a></div>
+    <div class="row"><a class="btn" href="{candidates[0]}">Открыть (.sub)</a></div>
+    <div class="row"><a class="btn" href="{candidates[1]}">Открыть (import b64)</a></div>
+    <div class="row"><a class="btn" href="{candidates[2]}">Открыть (subscribe)</a></div>
     <script>
       const links = {json.dumps(candidates)};
       let idx = 0;
@@ -598,17 +560,21 @@ def go_launcher(token: str):
         return Response(html, status=200, mimetype='text/html')
     except Exception as e:
         logger.error(f"/go error: {e}")
-        return Response("Bad or expired token", status=400, mimetype='text/plain')
+        return Response('Internal error', status=500, mimetype='text/plain')
+
+
+@app.route('/health')
+def health_check():
+    return Response('OK', status=200, mimetype='text/plain')
 
 
 @app.route('/')
 def index():
-    return """
-    <h1>LsJ VPN Subscription Server</h1>
-    <p>Сервер для автоматического подключения V2Ray через deeplink</p>
-    <p>Формат: /sub/{token}</p>
-    <p>Где token = base64(user_id_subscription_type)</p>
-    """
+    return (
+        "<h1>LsJ VPN Subscription Server</h1>"
+        "<p>Сервер для автоимпорта V2Ray (V2RayTun).</p>"
+        "<p>Используйте: /sub/&lt;token&gt; или /sub/&lt;token&gt;.sub</p>"
+    )
 
 
 if __name__ == '__main__':
