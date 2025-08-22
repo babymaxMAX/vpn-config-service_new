@@ -6,7 +6,6 @@ from flask import Flask, request, render_template_string, abort
 
 app = Flask(__name__)
 
-# -------------------- Config --------------------
 APP_NAME = os.environ.get("APP_NAME", "VPN Config Service")
 FORCE_HTTPS = os.environ.get("FORCE_HTTPS", "1") == "1"
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -15,7 +14,6 @@ ALLOWED_SCHEMES = set((os.environ.get("ALLOWED_SCHEMES") or "v2raytun").split(",
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("vpn-config-service")
 
-# -------------------- Templates --------------------
 HTML_OPEN = """
 <!doctype html>
 <html lang="ru">
@@ -26,11 +24,11 @@ HTML_OPEN = """
   {% if force_https %}<script>if(location.protocol!=="https:"){location.href="https:"+location.href.substring(location.protocol.length);}</script>{% endif %}
   <style>
     :root { color-scheme: dark; }
-    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; }
-    .card { max-width: 720px; margin: 0 auto; background: #111827; padding: 24px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,.4); }
-    .btn { display: inline-block; margin: 12px 8px 0 0; padding: 12px 16px; border-radius: 8px; background: #2563eb; color: #fff; text-decoration: none; }
-    .btn.secondary { background: #334155; }
-    code, pre { white-space: pre-wrap; word-break: break-all; }
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial,sans-serif; margin:0; padding:24px; background:#0f172a; color:#e2e8f0; }
+    .card { max-width:720px; margin:0 auto; background:#111827; padding:24px; border-radius:12px; box-shadow:0 10px 30px rgba(0,0,0,.4); }
+    .btn { display:inline-block; margin:12px 8px 0 0; padding:12px 16px; border-radius:8px; background:#2563eb; color:#fff; text-decoration:none; }
+    .btn.secondary { background:#334155; }
+    code,pre { white-space:pre-wrap; word-break:break-all; }
   </style>
 </head>
 <body>
@@ -62,7 +60,6 @@ HTML_OPEN = """
 </html>
 """
 
-# -------------------- Helpers --------------------
 def _is_allowed_scheme(url: str) -> bool:
     try:
         parsed = up.urlparse(url)
@@ -70,7 +67,6 @@ def _is_allowed_scheme(url: str) -> bool:
     except Exception:
         return False
 
-# -------------------- Routes --------------------
 @app.get("/")
 def index():
     return {"service": APP_NAME, "status": "ok"}, 200
@@ -81,39 +77,27 @@ def healthz():
 
 @app.get("/open")
 def open_link():
-    """
-    /open?url=<urlencoded(deeplink)>
-    Например: /open?url=v2raytun%3A%2F%2Fimport%2Fvless%25253A%25252F%25252F...
-    """
     url = (request.args.get("url") or "").strip()
     if not url:
         abort(400, "missing url")
-
-    # Для валидации схемы достаточно одного unquote
     decoded_for_check = up.unquote(url)
     if not _is_allowed_scheme(decoded_for_check):
         abort(400, "unsupported scheme")
-
     logger.info("OPEN deeplink=%s", url)
-
     return render_template_string(
         HTML_OPEN,
         app_name=APP_NAME,
-        deep_link=url,        # показываем и открываем как есть (уже urlencoded ботом)
+        deep_link=url,
         deep_link_js=url,
         force_https=FORCE_HTTPS,
     )
 
 @app.get("/copy")
 def copy_page():
-    """
-    /copy?text=<urlencoded(vless)>
-    Страница для ручного копирования исходного ключа.
-    """
     text = request.args.get("text") or ""
     page = f"""<!doctype html><meta charset="utf-8"><title>Copy</title>
     <textarea style="width:100%;height:70vh">{html.escape(text)}</textarea>"""
     return page
-  # -------------------- Local run --------------------
+
 if name == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
