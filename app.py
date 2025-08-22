@@ -98,6 +98,3 @@ def copy_page():
     page = f"""<!doctype html><meta charset="utf-8"><title>Copy</title>
     <textarea style="width:100%;height:70vh">{html.escape(text)}</textarea>"""
     return page
-
-if name == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
